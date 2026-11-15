@@ -1,19 +1,41 @@
-# RustPad v0.5 — Session Persistence, `cargo new`, Point-and-Shoot Member Help & `F1` Docs
+# RustPad
 
-A lightweight, PSPad-inspired programmer's editor in pure Rust (`eframe`/`egui`).
+**RustPad** is a fast, lightweight, PSPad-inspired programmer's editor written in pure Rust, purpose-built for Rust development[cite: 30, 40]. 
 
-## New in v0.5
-1. **Session Persistence (`rustpad_session.json`):**
-   - Automatically remembers all open file paths, the active tab, each file's cursor position, the active Cargo project folder, and theme/font settings across restarts.
-   - Saved automatically on exit and whenever files, tabs, or project folders change.
-2. **`cargo new` Project Creator (`Ctrl+Shift+N`):**
-   - Available via **File -> New Cargo Project (`cargo new`)...** and **Build -> New Cargo Project (`cargo new`)...**.
-   - Pick the parent folder, enter a crate name, choose Binary (`--bin`) or Library (`--lib`), and click **Create Project**.
-   - Automatically sets the Cargo Project Folder to the new crate and opens `src/main.rs` (or `src/lib.rs`) in a tab.
-3. **Option A: Point-and-Shoot Member Function Browser (`Ctrl+.` or `Alt+M`):**
-   - Place your cursor after `my_var.` (or `my_var.len`) and press **`Ctrl+.`** or **`Alt+M`**.
-   - **Smart Heuristic Type Scanner:** Scans your current file for local declarations (`let s = "..."`, `let mut v = Vec::new()`, `let opt = Some(...)`, `fn foo(p: &Path)`, or local `struct` / `impl` blocks across all open tabs) and auto-selects the matching type category!
-   - **Filter & Shoot:** Browse curated methods for `str / String`, `Vec / [T]`, `Option<T>`, `Result<T, E>`, `Iterator`, `Path / PathBuf`, `Numbers (f64 / usize / i32)`, `HashMap / HashSet`, or `Local impls`, filter by typing, and click or press `Enter` to shoot the method straight into your code with the cursor placed inside `(|)` when arguments are needed.
-4. **Option B (`F1`): Instant Offline Rust Doc Lookup:**
-   - Place your cursor on any identifier, type, or method (or highlight a query) and press **`F1`**.
-   - Runs `rustup doc --std <symbol>` in the background to open the local offline Rust standard library documentation directly in your browser.
+Modern IDEs often bundle full web browsers or require gigabytes of RAM just to edit a few source files. RustPad takes a pragmatic, first-principles approach: it compiles to a single native executable, launches instantaneously, and provides essential code-editing and `cargo` build-tool integration with minimal external dependencies.
+
+---
+
+## Key Features
+
+* **Multi-File Tabbed Workspace:** Open, edit, and switch between multiple source files simultaneously (`Ctrl+Tab`), with per-file undo/redo history (`Ctrl+Z` / `Ctrl+Y`), dirty-state indicators (`*`), and one-key **Save All** (`Ctrl+Shift+S`).
+* **Zero-Dependency Rust Syntax Highlighter:** Built-in single-pass lexical scanner that colors Rust keywords, standard library and `UpperCamelCase` types, string and character literals, lifetimes (`'a`), macros (`println!`), attributes (`#[derive(...)]`), numeric literals, and nested block comments (`/* ... */`)[cite: 2, 47]. Switchable on the fly between a **Dark Syntax Theme** and a **Classic PSPad Light Theme**[cite: 2, 40, 42].
+* **Context-Aware Brace & Delimiter Matching:** Live highlighting of matching `{...}`, `(...)`, and `[...]` pairs whenever the caret rests on or adjacent to a delimiter, complete with exact `Ln, Col` coordinate readouts in the status bar[cite: 2, 42, 48]. Automatically ignores delimiters inside string literals, character literals, and comments[cite: 2, 48].
+* **PSPad-Style Clip / Template Expansion (`Ctrl+J` / `Ctrl+Space`):** Type a short trigger word (such as `fn`, `pfn`, `main`, `for`, `if`, `ifel`, `match`, `struct`, `enum`, `impl`, `test`, `pr`, or `epr`) and press `Ctrl+J` to expand it in place with automatic indentation and caret placement[cite: 2, 40, 46]. Clips can also be inserted from the **Misc** menu or the toggleable **Clips Sidebar**.
+* **Async Cargo Build Runner & Clickable Diagnostics:** Run `cargo check` (`F9`), `cargo build` (`Ctrl+F9`), `cargo clippy`, `cargo test` (`Shift+F9`), or `cargo run` (`F5`) on a background thread without freezing the UI[cite: 30, 40, 43]. Compiler errors and warnings are parsed from `rustc`'s JSON output into a split bottom dock: click any diagnostic on the left to open the file, jump to the exact line and column, and highlight the offending span while inspecting the full borrow-checker explanation on the right.
+* **Single-File & Multi-File Search ("Find in Files"):** 
+  * **In-File Find & Replace (`Ctrl+F` / `Ctrl+H`):** Case-sensitive or case-insensitive search with forward/backward navigation (`F3` / `Shift+F3`) and visible match selection[cite: 30, 40, 42, 44].
+  * **Find in Files (`Ctrl+Shift+F`):** Recursively search across your project directory tree (automatically skipping `target/` and `.git/`) or across all open tabs by file extension (`rs, toml, md`)[cite: 30, 42, 44]. Click any match in the bottom **Search Results** tab to jump straight to that file and line[cite: 42].
+* **Block Line Comment Toggling (`Ctrl+/` or `Ctrl+Shift+A`):** Comment or uncomment single lines or multi-line selections with `// `[cite: 2, 40, 45].
+
+---
+
+## Prerequisites & Dependencies
+
+To build and run RustPad, you only need a standard Rust toolchain (`rustc` and `cargo`, edition 2021 or newer)[cite: 2, 41].
+
+RustPad keeps its dependency tree intentionally small[cite: 41]:
+* [`eframe` / `egui`](https://github.com/emilk/egui) (`0.29`) — Immediate-mode native GUI windowing and text rendering[cite: 41, 42].
+* [`rfd`](https://github.com/PolyMeilex/rfd) (`0.15`) — Native OS file and folder selection dialogs[cite: 41, 42].
+* [`serde`](https://serde.rs/) & [`serde_json`](https://github.com/serde-rs/json) (`1.0`) — Parsing structured `--message-format=json` compiler diagnostics from Cargo[cite: 41, 43].
+
+---
+
+## Building and Running
+
+Clone the repository and build the optimized release binary using Cargo:
+
+```bash
+git clone [https://github.com/robalexander1234/rustpad.git](https://github.com/robalexander1234/rustpad.git)
+cd rustpad
+cargo run --release
