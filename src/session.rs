@@ -18,6 +18,8 @@ pub struct SavedTabState {
 pub struct SessionState {
     pub open_files: Vec<SavedTabState>,
     pub active_tab_path: Option<PathBuf>,
+    #[serde(default)]
+    pub recent_files: Vec<PathBuf>,
     pub cargo_working_dir: String,
     pub dark_mode: bool,
     pub font_size: f32,
@@ -54,6 +56,7 @@ impl SessionState {
     pub fn save_from_app(
         documents: &[Document],
         active_tab: usize,
+        recent_files: &[PathBuf],
         cargo_working_dir: &str,
         dark_mode: bool,
         font_size: f32,
@@ -73,6 +76,7 @@ impl SessionState {
         let state = SessionState {
             open_files,
             active_tab_path,
+            recent_files: recent_files.iter().take(3).cloned().collect(),
             cargo_working_dir: cargo_working_dir.to_string(),
             dark_mode,
             font_size,

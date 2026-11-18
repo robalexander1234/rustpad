@@ -1,12 +1,18 @@
 use crate::brace_matcher::char_to_byte_idx;
 use std::fs;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
+use std::time::SystemTime;
+
+pub fn file_modified_time(path: &Path) -> Option<SystemTime> {
+    fs::metadata(path).ok()?.modified().ok()
+}
 
 pub struct Document {
     pub title: String,
     pub path: Option<PathBuf>,
     pub content: String,
     pub is_dirty: bool,
+    pub last_modified: Option<SystemTime>,
     pub cursor_char_idx: usize,
     pub selection_char_range: Option<(usize, usize)>,
     pub undo_stack: Vec<String>,
@@ -20,6 +26,7 @@ impl Document {
             path: None,
             content: String::new(),
             is_dirty: false,
+            last_modified: None,
             cursor_char_idx: 0,
             selection_char_range: None,
             undo_stack: Vec::new(),
@@ -71,6 +78,7 @@ fn main() {
             path: None,
             content: sample.to_string(),
             is_dirty: false,
+            last_modified: None,
             cursor_char_idx: 0,
             selection_char_range: None,
             undo_stack: Vec::new(),
@@ -89,11 +97,13 @@ fn main() {
             .unwrap_or("file.rs")
             .to_string();
 
+        let last_modified = file_modified_time(&path);
         Ok(Self {
             title,
             path: Some(path),
             content,
             is_dirty: false,
+            last_modified,
             cursor_char_idx: 0,
             selection_char_range: None,
             undo_stack: Vec::new(),
@@ -105,6 +115,7 @@ fn main() {
         if let Some(ref path) = self.path {
             fs::write(path, &self.content)
                 .map_err(|e| format!("Failed to save {}: {}", path.display(), e))?;
+            self.last_modified = file_modified_time(path);
             self.is_dirty = false;
             Ok(())
         } else {
@@ -120,11 +131,34 @@ fn main() {
             .and_then(|n| n.to_str())
             .unwrap_or("file.rs")
             .to_string();
+        self.last_modified = file_modified_time(&path);
         self.path = Some(path);
         self.is_dirty = false;
         Ok(())
     }
 
+    /// Reloads the document content from disk, pushing the previous buffer to the undo stack.
+/// Reloads the document content from disk, pushing the previous buffer to the undo stack.
+    pub fn reload_from_disk(&mut self) -> Result<(), String> {
+        let Some(ref path) = self.path else {
+            return Err("No file path assigned".to_string());
+        };
+        let raw = fs::read_to_string(path)
+            .map_err(|e| format!("Failed to reload {}: {}", path.display(), e))?;
+        let new_mtime = file_modified_time(path); // immutable borrow of `self.path` ends here
+
+        let new_content = raw.replace("\r\n", "\n");
+        let snapshot = self.content.clone();
+        self.push_undo_snapshot(snapshot);
+        self.content = new_content;
+        self.last_modified = new_mtime;
+        self.is_dirty = false;
+        let max_chars = self.content.chars().count();
+        self.cursor_char_idx = self.cursor_char_idx.min(max_chars);
+        self.selection_char_range = None;
+        Ok(())
+    }
+    
     pub fn push_undo_snapshot(&mut self, snapshot: String) {
         if self
             .undo_stack

@@ -12,6 +12,7 @@ pub enum CargoSubcommand {
     Check,
     Build,
     Clippy,
+    Fmt,
     Test,
     Run,
 }
@@ -22,6 +23,7 @@ impl CargoSubcommand {
             CargoSubcommand::Check => "check",
             CargoSubcommand::Build => "build",
             CargoSubcommand::Clippy => "clippy",
+            CargoSubcommand::Fmt => "fmt",
             CargoSubcommand::Test => "test",
             CargoSubcommand::Run => "run",
         }
@@ -32,6 +34,7 @@ impl CargoSubcommand {
             CargoSubcommand::Check => "cargo check (F9)",
             CargoSubcommand::Build => "cargo build (Ctrl+F9)",
             CargoSubcommand::Clippy => "cargo clippy",
+            CargoSubcommand::Fmt => "cargo fmt (Alt+Shift+F)",
             CargoSubcommand::Test => "cargo test (Shift+F9)",
             CargoSubcommand::Run => "cargo run (F5)",
         }
@@ -177,14 +180,22 @@ pub fn spawn_cargo_command(cmd: CargoSubcommand, working_dir: PathBuf) -> Receiv
     thread::spawn(move || {
         let mut command = Command::new("cargo");
         command.arg(cmd.as_arg());
-        command.arg("--message-format=json");
+        let use_json = cmd != CargoSubcommand::Fmt;
+        if use_json {
+            command.arg("--message-format=json");
+        }
         command.current_dir(&working_dir);
         command.stdout(Stdio::piped());
         command.stderr(Stdio::piped());
 
+        let cmd_desc = if use_json {
+            format!("cargo {} --message-format=json", cmd.as_arg())
+        } else {
+            format!("cargo {}", cmd.as_arg())
+        };
         let _ = tx.send(CargoEvent::RawLine(format!(
-            "=== Running `cargo {} --message-format=json` in {} ===",
-            cmd.as_arg(),
+            "=== Running `{}` in {} ===",
+            cmd_desc,
             working_dir.display()
         )));
 

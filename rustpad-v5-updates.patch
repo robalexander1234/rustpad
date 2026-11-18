@@ -1,0 +1,535 @@
+diff --git a/src/cargo_runner.rs b/src/cargo_runner.rs
+--- a/src/cargo_runner.rs
++++ b/src/cargo_runner.rs
+@@ -12,6 +12,7 @@
+     Check,
+     Build,
+     Clippy,
++    Fmt,
+     Test,
+     Run,
+ }
+@@ -22,6 +23,7 @@
+             CargoSubcommand::Check => "check",
+             CargoSubcommand::Build => "build",
+             CargoSubcommand::Clippy => "clippy",
++            CargoSubcommand::Fmt => "fmt",
+             CargoSubcommand::Test => "test",
+             CargoSubcommand::Run => "run",
+         }
+@@ -32,6 +34,7 @@
+             CargoSubcommand::Check => "cargo check (F9)",
+             CargoSubcommand::Build => "cargo build (Ctrl+F9)",
+             CargoSubcommand::Clippy => "cargo clippy",
++            CargoSubcommand::Fmt => "cargo fmt (Alt+Shift+F)",
+             CargoSubcommand::Test => "cargo test (Shift+F9)",
+             CargoSubcommand::Run => "cargo run (F5)",
+         }
+@@ -177,14 +180,22 @@
+     thread::spawn(move || {
+         let mut command = Command::new("cargo");
+         command.arg(cmd.as_arg());
+-        command.arg("--message-format=json");
++        let use_json = cmd != CargoSubcommand::Fmt;
++        if use_json {
++            command.arg("--message-format=json");
++        }
+         command.current_dir(&working_dir);
+         command.stdout(Stdio::piped());
+         command.stderr(Stdio::piped());
+ 
++        let cmd_desc = if use_json {
++            format!("cargo {} --message-format=json", cmd.as_arg())
++        } else {
++            format!("cargo {}", cmd.as_arg())
++        };
+         let _ = tx.send(CargoEvent::RawLine(format!(
+-            "=== Running `cargo {} --message-format=json` in {} ===",
+-            cmd.as_arg(),
++            "=== Running `{}` in {} ===",
++            cmd_desc,
+             working_dir.display()
+         )));
+ 
+diff --git a/src/main.rs b/src/main.rs
+--- a/src/main.rs
++++ b/src/main.rs
+@@ -10,8 +10,10 @@
+ use eframe::egui::text::{CCursor, CCursorRange};
+ use eframe::egui::text_edit::TextEditOutput;
+ use eframe::egui::{self, Color32, FontFamily, FontId, Key, KeyboardShortcut, Modifiers, RichText};
++use std::collections::HashMap;
+ use std::path::{Path, PathBuf};
+ use std::sync::mpsc::Receiver;
++use std::time::{Duration, Instant, SystemTime};
+ 
+ use brace_matcher::{byte_to_line_col, char_to_byte_idx, find_matching_brace, BraceMatch};
+ use cargo_runner::{
+@@ -26,7 +28,7 @@
+ use search::{find_in_text, run_multifile_search, SearchMatch, SearchScope};
+ use session::SessionState;
+ use templates::{insert_template_at_cursor, try_expand_template, BUILTIN_TEMPLATES};
+-use workspace::Document;
++use workspace::{file_modified_time, Document};
+ 
+ #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+ enum BottomTab {
+@@ -103,6 +105,14 @@
+     show_bottom_panel: bool,
+     bottom_tab: BottomTab,
+ 
++    // LRU list of last 3 edited files (shown under File dropdown)
++    recent_files: Vec<PathBuf>,
++
++    // External disk-change detection & reload prompt
++    last_disk_check: Instant,
++    pending_reload_paths: Vec<PathBuf>,
++    ignored_disk_mtimes: HashMap<PathBuf, SystemTime>,
++
+     // Go To Line modal (Ctrl+G)
+     show_goto_line_modal: bool,
+     goto_line_input: String,
+@@ -120,6 +130,7 @@
+ 
+         let mut documents = Vec::new();
+         let mut active_tab = 0usize;
++        let mut recent_files: Vec<PathBuf> = Vec::new();
+         let mut cargo_working_dir = cwd.clone();
+         let mut dark_mode = true;
+         let mut font_size = 14.5_f32;
+@@ -130,6 +141,12 @@
+         if let Some(saved) = SessionState::load() {
+             dark_mode = saved.dark_mode;
+             font_size = saved.font_size.clamp(9.0, 28.0);
++            recent_files = saved
++                .recent_files
++                .into_iter()
++                .filter(|p| p.is_file())
++                .take(3)
++                .collect();
+             if !saved.cargo_working_dir.trim().is_empty()
+                 && Path::new(saved.cargo_working_dir.trim()).exists()
+             {
+@@ -224,6 +241,12 @@
+             show_bottom_panel: true,
+             bottom_tab: BottomTab::CompilerDiagnostics,
+ 
++            recent_files,
++
++            last_disk_check: Instant::now(),
++            pending_reload_paths: Vec::new(),
++            ignored_disk_mtimes: HashMap::new(),
++
+             show_goto_line_modal: false,
+             goto_line_input: String::new(),
+ 
+@@ -239,10 +262,48 @@
+         SessionState::save_from_app(
+             &self.documents,
+             self.active_tab,
++            &self.recent_files,
+             &self.cargo_working_dir,
+             self.dark_mode,
+             self.font_size,
+         );
++    }
++
++    /// Updates the 3-item LRU list of recently edited files (most recent at index 0).
++    fn record_recent_file(&mut self, path: &Path) {
++        if self.recent_files.first().map(|p| p.as_path()) == Some(path) {
++            return;
++        }
++        self.recent_files.retain(|p| p.as_path() != path);
++        self.recent_files.insert(0, path.to_path_buf());
++        self.recent_files.truncate(3);
++    }
++
++    /// Periodically checks open files on disk for external modifications.
++    fn poll_disk_changes(&mut self) {
++        if self.last_disk_check.elapsed() < Duration::from_secs(1) {
++            return;
++        }
++        self.last_disk_check = Instant::now();
++
++        for doc in &self.documents {
++            let Some(ref path) = doc.path else {
++                continue;
++            };
++            let Some(disk_mtime) = file_modified_time(path) else {
++                continue;
++            };
++            let changed = match doc.last_modified {
++                Some(known) => disk_mtime != known,
++                None => false,
++            };
++            if changed {
++                let already_ignored = self.ignored_disk_mtimes.get(path) == Some(&disk_mtime);
++                if !already_ignored && !self.pending_reload_paths.contains(path) {
++                    self.pending_reload_paths.push(path.clone());
++                }
++            }
++        }
+     }
+ 
+     fn active_doc(&self) -> Option<&Document> {
+@@ -457,6 +518,12 @@
+         if doc.path.is_some() {
+             match doc.save() {
+                 Ok(()) => {
++                    let saved_path = self.documents[self.active_tab].path.clone();
++                    if let Some(p) = saved_path {
++                        self.record_recent_file(&p);
++                        self.ignored_disk_mtimes.remove(&p);
++                        self.pending_reload_paths.retain(|rp| rp != &p);
++                    }
+                     self.status_message =
+                         format!("Saved {}", self.documents[self.active_tab].title);
+                     self.save_session();
+@@ -481,9 +548,13 @@
+             if let Some(root) = find_cargo_root(&path) {
+                 self.cargo_working_dir = root.display().to_string();
+             }
++            let saved_path = path.clone();
+             if let Some(doc) = self.active_doc_mut() {
+                 match doc.save_as(path) {
+                     Ok(()) => {
++                        self.record_recent_file(&saved_path);
++                        self.ignored_disk_mtimes.remove(&saved_path);
++                        self.pending_reload_paths.retain(|rp| rp != &saved_path);
+                         self.status_message =
+                             format!("Saved as {}", self.documents[self.active_tab].title);
+                         self.save_session();
+@@ -495,13 +566,21 @@
+     }
+ 
+     fn action_save_all(&mut self) {
+-        let mut saved_count = 0usize;
++        let mut saved_paths = Vec::new();
+         for doc in &mut self.documents {
+             if doc.path.is_some() && doc.is_dirty {
+                 if doc.save().is_ok() {
+-                    saved_count += 1;
+-                }
+-            }
++                    if let Some(ref p) = doc.path {
++                        saved_paths.push(p.clone());
++                    }
++                }
++            }
++        }
++        let saved_count = saved_paths.len();
++        for p in saved_paths {
++            self.record_recent_file(&p);
++            self.ignored_disk_mtimes.remove(&p);
++            self.pending_reload_paths.retain(|rp| rp != &p);
+         }
+         self.save_session();
+         self.status_message = format!("Save All completed ({} file(s) written).", saved_count);
+@@ -647,7 +726,9 @@
+         self.cargo_running = true;
+         self.show_bottom_panel = true;
+         self.bottom_tab = match subcmd {
+-            CargoSubcommand::Run | CargoSubcommand::Test => BottomTab::CargoRawLog,
++            CargoSubcommand::Run | CargoSubcommand::Test | CargoSubcommand::Fmt => {
++                BottomTab::CargoRawLog
++            }
+             _ => BottomTab::CompilerDiagnostics,
+         };
+ 
+@@ -790,6 +871,7 @@
+ 
+         let sc_cargo_check = KeyboardShortcut::new(Modifiers::NONE, Key::F9);
+         let sc_cargo_build = KeyboardShortcut::new(Modifiers::CTRL, Key::F9);
++        let sc_cargo_fmt = KeyboardShortcut::new(Modifiers::ALT | Modifiers::SHIFT, Key::F);
+         let sc_cargo_test = KeyboardShortcut::new(Modifiers::SHIFT, Key::F9);
+         let sc_cargo_run = KeyboardShortcut::new(Modifiers::NONE, Key::F5);
+ 
+@@ -849,6 +931,8 @@
+                 }
+             } else if i.consume_shortcut(&sc_cargo_build) {
+                 self.action_run_cargo(CargoSubcommand::Build);
++            } else if i.consume_shortcut(&sc_cargo_fmt) {
++                self.action_run_cargo(CargoSubcommand::Fmt);
+             } else if i.consume_shortcut(&sc_cargo_test) {
+                 self.action_run_cargo(CargoSubcommand::Test);
+             } else if i.consume_shortcut(&sc_cargo_check) {
+@@ -874,7 +958,88 @@
+         }
+ 
+         self.poll_cargo_events(ctx);
++        self.poll_disk_changes();
++        ctx.request_repaint_after(Duration::from_secs(1));
+         self.handle_keyboard_shortcuts(ctx);
++
++        // =========================================================================
++        // Modal 0: External File Change on Disk Prompt
++        // =========================================================================
++        if let Some(changed_path) = self.pending_reload_paths.first().cloned() {
++            let doc_info = self
++                .documents
++                .iter()
++                .position(|d| d.path.as_ref() == Some(&changed_path))
++                .map(|idx| (idx, self.documents[idx].title.clone(), self.documents[idx].is_dirty));
++
++            if let Some((doc_idx, doc_title, is_dirty)) = doc_info {
++                let mut action_reload = false;
++                let mut action_ignore = false;
++
++                egui::Window::new("File Changed on Disk")
++                    .collapsible(false)
++                    .resizable(false)
++                    .default_width(480.0)
++                    .show(ctx, |ui| {
++                        ui.label(
++                            RichText::new(format!(
++                                "`{}` has been modified on disk by another program.",
++                                doc_title
++                            ))
++                            .strong(),
++                        );
++                        ui.label(
++                            RichText::new(changed_path.display().to_string())
++                                .monospace()
++                                .small(),
++                        );
++                        if is_dirty {
++                            ui.add_space(4.0);
++                            ui.colored_label(
++                                Color32::from_rgb(255, 175, 70),
++                                "⚠ This buffer has unsaved edits. Reloading will replace them (you can still Undo with Ctrl+Z).",
++                            );
++                        }
++                        ui.add_space(8.0);
++                        ui.separator();
++                        ui.horizontal(|ui| {
++                            if ui.button("Reload from Disk").clicked() {
++                                action_reload = true;
++                            }
++                            if ui.button("Keep Current Buffer").clicked() {
++                                action_ignore = true;
++                            }
++                        });
++                    });
++
++                if action_reload {
++                    match self.documents[doc_idx].reload_from_disk() {
++                        Ok(()) => {
++                            let c_idx = self.documents[doc_idx].cursor_char_idx;
++                            if doc_idx == self.active_tab {
++                                self.pending_selection_override = Some((c_idx, c_idx));
++                            }
++                            self.ignored_disk_mtimes.remove(&changed_path);
++                            self.status_message = format!("Reloaded {} from disk.", doc_title);
++                        }
++                        Err(e) => {
++                            self.status_message = e;
++                        }
++                    }
++                    self.pending_reload_paths.retain(|p| p != &changed_path);
++                } else if action_ignore {
++                    if let Some(disk_mtime) = file_modified_time(&changed_path) {
++                        self.ignored_disk_mtimes.insert(changed_path.clone(), disk_mtime);
++                    }
++                    self.pending_reload_paths.retain(|p| p != &changed_path);
++                    self.status_message =
++                        format!("Kept current buffer for {} (ignored disk change).", doc_title);
++                }
++            } else {
++                // Tab was closed before user responded
++                self.pending_reload_paths.retain(|p| p != &changed_path);
++            }
++        }
+ 
+         // =========================================================================
+         // Modal 1: `cargo new` Project Creator Dialog (Ctrl+Shift+N)
+@@ -1378,6 +1543,32 @@
+                         ui.close_menu();
+                     }
+                     ui.separator();
++                    ui.label(
++                        RichText::new("Recent Edited Files:")
++                            .small()
++                            .color(Color32::from_gray(150)),
++                    );
++                    if self.recent_files.is_empty() {
++                        ui.add_enabled(false, egui::Button::new("  (None yet)"));
++                    } else {
++                        let recent_snapshot = self.recent_files.clone();
++                        for (idx, recent_path) in recent_snapshot.iter().enumerate() {
++                            let file_name = recent_path
++                                .file_name()
++                                .and_then(|n| n.to_str())
++                                .unwrap_or("file");
++                            let label = format!("  {}. {}", idx + 1, file_name);
++                            if ui
++                                .button(label)
++                                .on_hover_text(recent_path.display().to_string())
++                                .clicked()
++                            {
++                                self.open_or_activate_path(recent_path.clone());
++                                ui.close_menu();
++                            }
++                        }
++                    }
++                    ui.separator();
+                     if ui.button("Save (Ctrl+S)").clicked() {
+                         self.action_save_active();
+                         ui.close_menu();
+@@ -1498,6 +1689,10 @@
+                         }
+                         if ui.button("Cargo Clippy (Lint)").clicked() {
+                             self.action_run_cargo(CargoSubcommand::Clippy);
++                            ui.close_menu();
++                        }
++                        if ui.button("Cargo Fmt (Format) (Alt+Shift+F)").clicked() {
++                            self.action_run_cargo(CargoSubcommand::Fmt);
+                             ui.close_menu();
+                         }
+                         if ui.button("Cargo Test (Shift+F9)").clicked() {
+@@ -2016,6 +2211,7 @@
+             let dark_mode = self.dark_mode;
+             let pending_selection = self.pending_selection_override.take();
+ 
++            let mut edited_file_path: Option<PathBuf> = None;
+             let Some(doc) = self.documents.get_mut(self.active_tab) else {
+                 return;
+             };
+@@ -2069,6 +2265,9 @@
+                         if output.response.changed() {
+                             doc.push_undo_snapshot(pre_edit_snapshot);
+                             doc.is_dirty = true;
++                            if let Some(ref p) = doc.path {
++                                edited_file_path = Some(p.clone());
++                            }
+                         }
+ 
+                         if let Some((start_char, end_char)) = pending_selection {
+@@ -2086,6 +2285,10 @@
+                         }
+                     });
+                 });
++
++            if let Some(p) = edited_file_path {
++                self.record_recent_file(&p);
++            }
+         });
+     }
+ }
+diff --git a/src/session.rs b/src/session.rs
+--- a/src/session.rs
++++ b/src/session.rs
+@@ -18,6 +18,8 @@
+ pub struct SessionState {
+     pub open_files: Vec<SavedTabState>,
+     pub active_tab_path: Option<PathBuf>,
++    #[serde(default)]
++    pub recent_files: Vec<PathBuf>,
+     pub cargo_working_dir: String,
+     pub dark_mode: bool,
+     pub font_size: f32,
+@@ -54,6 +56,7 @@
+     pub fn save_from_app(
+         documents: &[Document],
+         active_tab: usize,
++        recent_files: &[PathBuf],
+         cargo_working_dir: &str,
+         dark_mode: bool,
+         font_size: f32,
+@@ -73,6 +76,7 @@
+         let state = SessionState {
+             open_files,
+             active_tab_path,
++            recent_files: recent_files.iter().take(3).cloned().collect(),
+             cargo_working_dir: cargo_working_dir.to_string(),
+             dark_mode,
+             font_size,
+diff --git a/src/workspace.rs b/src/workspace.rs
+--- a/src/workspace.rs
++++ b/src/workspace.rs
+@@ -1,12 +1,18 @@
+ use crate::brace_matcher::char_to_byte_idx;
+ use std::fs;
+-use std::path::PathBuf;
++use std::path::{Path, PathBuf};
++use std::time::SystemTime;
++
++pub fn file_modified_time(path: &Path) -> Option<SystemTime> {
++    fs::metadata(path).ok()?.modified().ok()
++}
+ 
+ pub struct Document {
+     pub title: String,
+     pub path: Option<PathBuf>,
+     pub content: String,
+     pub is_dirty: bool,
++    pub last_modified: Option<SystemTime>,
+     pub cursor_char_idx: usize,
+     pub selection_char_range: Option<(usize, usize)>,
+     pub undo_stack: Vec<String>,
+@@ -20,6 +26,7 @@
+             path: None,
+             content: String::new(),
+             is_dirty: false,
++            last_modified: None,
+             cursor_char_idx: 0,
+             selection_char_range: None,
+             undo_stack: Vec::new(),
+@@ -71,6 +78,7 @@
+             path: None,
+             content: sample.to_string(),
+             is_dirty: false,
++            last_modified: None,
+             cursor_char_idx: 0,
+             selection_char_range: None,
+             undo_stack: Vec::new(),
+@@ -89,11 +97,13 @@
+             .unwrap_or("file.rs")
+             .to_string();
+ 
++        let last_modified = file_modified_time(&path);
+         Ok(Self {
+             title,
+             path: Some(path),
+             content,
+             is_dirty: false,
++            last_modified,
+             cursor_char_idx: 0,
+             selection_char_range: None,
+             undo_stack: Vec::new(),
+@@ -105,6 +115,7 @@
+         if let Some(ref path) = self.path {
+             fs::write(path, &self.content)
+                 .map_err(|e| format!("Failed to save {}: {}", path.display(), e))?;
++            self.last_modified = file_modified_time(path);
+             self.is_dirty = false;
+             Ok(())
+         } else {
+@@ -120,8 +131,28 @@
+             .and_then(|n| n.to_str())
+             .unwrap_or("file.rs")
+             .to_string();
++        self.last_modified = file_modified_time(&path);
+         self.path = Some(path);
+         self.is_dirty = false;
++        Ok(())
++    }
++
++    /// Reloads the document content from disk, pushing the previous buffer to the undo stack.
++    pub fn reload_from_disk(&mut self) -> Result<(), String> {
++        let Some(ref path) = self.path else {
++            return Err("No file path assigned".to_string());
++        };
++        let raw = fs::read_to_string(path)
++            .map_err(|e| format!("Failed to reload {}: {}", path.display(), e))?;
++        let new_content = raw.replace("\r\n", "\n");
++        let snapshot = self.content.clone();
++        self.push_undo_snapshot(snapshot);
++        self.content = new_content;
++        self.last_modified = file_modified_time(path);
++        self.is_dirty = false;
++        let max_chars = self.content.chars().count();
++        self.cursor_char_idx = self.cursor_char_idx.min(max_chars);
++        self.selection_char_range = None;
+         Ok(())
+     }
+ 
